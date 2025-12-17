@@ -5,3 +5,4 @@ __pycache__/
 data/videos/
 models/
 .env
+models/
