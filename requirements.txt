@@ -3,3 +3,6 @@ opencv-python
 cvzone
 deep-sort-realtime
 numpy
+torch
+torchvision
+torchaudio

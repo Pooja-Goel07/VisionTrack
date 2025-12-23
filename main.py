@@ -1,18 +1,26 @@
 from ultralytics import YOLO
 import cv2
 import cvzone
-import math
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from collections import defaultdict
+import torch
 
 cap = cv2.VideoCapture("data/videos/people.mp4")
 
-model = YOLO("models/yolov8n.pt")
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = YOLO("models/yolov8n.pt").to(device)
+
+# ------------------ DeepSORT Tracker ------------------
 tracker = DeepSort(
     max_age=30,
     n_init=3,
-    max_iou_distance=0.7
+    max_iou_distance=0.7,
 )
+
+# ------------------ Track History ------------------
+track_history = defaultdict(list)
+MAX_HISTORY = 50
 
 classNames = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -28,20 +36,21 @@ classNames = [
     "toothbrush"
 ]
 
+# ------------------ Main Loop ------------------
 while True:
     success, img = cap.read()
     if not success:
         break
 
+    img = cv2.resize(img, (960, 540))
+
+    # ------------------ YOLO Detection ------------------
     results = model(img, stream=True)
     detections = []
 
-    # ------------------ YOLO detections ------------------
     for r in results:
         for box in r.boxes:
-            x1, y1, x2, y2 = box.xyxy[0]
-            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
             w, h = x2 - x1, y2 - y1
             conf = float(box.conf[0])
             cls = int(box.cls[0])
@@ -51,9 +60,10 @@ while True:
             if conf < 0.5:
                 continue
 
+            # DeepSORT format: ([x, y, w, h], confidence, class)
             detections.append(([x1, y1, w, h], conf, "person"))
 
-    # ------------------ DeepSORT tracking ------------------
+    # ------------------ DeepSORT Tracking ------------------
     tracks = tracker.update_tracks(detections, frame=img)
 
     for track in tracks:
@@ -64,15 +74,33 @@ while True:
         l, t, r, b = map(int, track.to_ltrb())
         w, h = r - l, b - t
 
-        cvzone.cornerRect(img, (l, t, w, h))
+        cx = l + w // 2
+        cy = b
+
+        track_history[track_id].append((cx, cy))
+
+
+        # Draw bounding box
+        cvzone.cornerRect(img, (l, t, w, h), l=9)
         cvzone.putTextRect(
             img,
             f"ID {track_id}",
             (l, t - 10),
-            scale=1.5,
+            scale=1.3,
             thickness=2,
             offset=3
         )
 
-    cv2.imshow("Image", img)
-    cv2.waitKey(1)
+        # Draw movement trail
+        points = track_history[track_id]
+        for i in range(1, len(points)):
+            cv2.line(img, points[i - 1], points[i], (255, 0, 255), 2)
+
+
+    cv2.imshow("People Tracking with History", img)
+
+    if cv2.waitKey(5) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
