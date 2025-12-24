@@ -14,10 +14,10 @@ tracker = DeepSort(
     max_age=30,
     n_init=3,
     max_iou_distance=0.7,
+    embedder="mobilenet"
 )
 
 track_history = defaultdict(list)
-MAX_HISTORY = 50
 
 classNames = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -33,7 +33,8 @@ classNames = [
     "toothbrush"
 ]
 
-LINE_Y = 480
+ZONE_Y_TOP = 360
+ZONE_Y_BOTTOM = 430
 
 while True:
     success, img = cap.read()
@@ -42,7 +43,13 @@ while True:
 
     img = cv2.resize(img, (960, 540))
 
-    cv2.line(img, (0, LINE_Y), (img.shape[1], LINE_Y), (0, 0, 255), 2)
+    cv2.rectangle(
+        img,
+        (0, ZONE_Y_TOP),
+        (img.shape[1], ZONE_Y_BOTTOM),
+        (0, 0, 255),
+        3
+    )
 
     results = model(img, stream=True)
     detections = []
@@ -90,7 +97,7 @@ while True:
         for i in range(1, len(points)):
             cv2.line(img, points[i - 1], points[i], (255, 0, 255), 2)
 
-    cv2.imshow("People Tracking with History", img)
+    cv2.imshow("Zone-Based People Tracking", img)
 
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
