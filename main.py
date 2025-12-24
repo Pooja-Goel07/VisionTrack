@@ -7,18 +7,15 @@ import torch
 
 cap = cv2.VideoCapture("data/videos/people.mp4")
 
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = YOLO("models/yolov8n.pt").to(device)
 
-# ------------------ DeepSORT Tracker ------------------
 tracker = DeepSort(
     max_age=30,
     n_init=3,
     max_iou_distance=0.7,
 )
 
-# ------------------ Track History ------------------
 track_history = defaultdict(list)
 MAX_HISTORY = 50
 
@@ -36,7 +33,8 @@ classNames = [
     "toothbrush"
 ]
 
-# ------------------ Main Loop ------------------
+LINE_Y = 480
+
 while True:
     success, img = cap.read()
     if not success:
@@ -44,7 +42,8 @@ while True:
 
     img = cv2.resize(img, (960, 540))
 
-    # ------------------ YOLO Detection ------------------
+    cv2.line(img, (0, LINE_Y), (img.shape[1], LINE_Y), (0, 0, 255), 2)
+
     results = model(img, stream=True)
     detections = []
 
@@ -60,10 +59,8 @@ while True:
             if conf < 0.5:
                 continue
 
-            # DeepSORT format: ([x, y, w, h], confidence, class)
             detections.append(([x1, y1, w, h], conf, "person"))
 
-    # ------------------ DeepSORT Tracking ------------------
     tracks = tracker.update_tracks(detections, frame=img)
 
     for track in tracks:
@@ -79,8 +76,6 @@ while True:
 
         track_history[track_id].append((cx, cy))
 
-
-        # Draw bounding box
         cvzone.cornerRect(img, (l, t, w, h), l=9)
         cvzone.putTextRect(
             img,
@@ -91,11 +86,9 @@ while True:
             offset=3
         )
 
-        # Draw movement trail
         points = track_history[track_id]
         for i in range(1, len(points)):
             cv2.line(img, points[i - 1], points[i], (255, 0, 255), 2)
-
 
     cv2.imshow("People Tracking with History", img)
 
