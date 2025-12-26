@@ -4,12 +4,16 @@ import cvzone
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from collections import defaultdict
 import torch
+import time
 
+# ---------------- VIDEO ----------------
 cap = cv2.VideoCapture("data/videos/people.mp4")
 
+# ---------------- MODEL ----------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = YOLO("models/yolov8n.pt").to(device)
 
+# ---------------- TRACKER ----------------
 tracker = DeepSort(
     max_age=30,
     n_init=3,
@@ -17,11 +21,16 @@ tracker = DeepSort(
     embedder="mobilenet"
 )
 
+# ---------------- STATE ----------------
 track_history = defaultdict(list)
-track_zone_state = {}
-entered_ids = set()
-exited_ids = set()
+track_zone_state = {}        # ID -> inside zone (True/False)
+zone_entry_time = {}         # ID -> entry timestamp
+loitering_ids = set()
 
+entry_count = 0
+exit_count = 0
+
+# ---------------- CLASSES ----------------
 classNames = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
     "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
@@ -36,9 +45,12 @@ classNames = [
     "toothbrush"
 ]
 
+# ---------------- ZONE ----------------
 ZONE_Y_TOP = 360
 ZONE_Y_BOTTOM = 430
+LOITER_THRESHOLD = 5.0  # seconds
 
+# ---------------- LOOP ----------------
 while True:
     success, img = cap.read()
     if not success:
@@ -46,6 +58,7 @@ while True:
 
     img = cv2.resize(img, (960, 540))
 
+    # Draw zone
     cv2.rectangle(
         img,
         (0, ZONE_Y_TOP),
@@ -57,6 +70,7 @@ while True:
     results = model(img, stream=True)
     detections = []
 
+    # ---------------- DETECTION ----------------
     for r in results:
         for box in r.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -71,7 +85,9 @@ while True:
 
             detections.append(([x1, y1, w, h], conf, "person"))
 
+    # ---------------- TRACKING ----------------
     tracks = tracker.update_tracks(detections, frame=img)
+    current_time = time.time()
 
     for track in tracks:
         if not track.is_confirmed():
@@ -82,60 +98,67 @@ while True:
         w, h = r - l, b - t
 
         cx = l + w // 2
-        cy = b
+        cy = b  # bottom center
 
         track_history[track_id].append((cx, cy))
 
         inside_zone = ZONE_Y_TOP <= cy <= ZONE_Y_BOTTOM
         prev_state = track_zone_state.get(track_id, False)
 
-        event_label = ""
+        label_suffix = ""
 
-        if inside_zone and not prev_state:
-            track_zone_state[track_id] = True
-            entered_ids.add(track_id)
-            event_label = "ENTER"
-            print(f"[ENTRY] ID {track_id}")
+        # ---------------- ENTRY / EXIT / LOITER ----------------
+        if inside_zone:
+            if not prev_state:
+                # ENTRY
+                track_zone_state[track_id] = True
+                zone_entry_time[track_id] = current_time
+                entry_count += 1
+            else:
+                dwell_time = current_time - zone_entry_time.get(track_id, current_time)
+                if dwell_time >= LOITER_THRESHOLD and track_id not in loitering_ids:
+                    loitering_ids.add(track_id)
+                    print(f"[LOITERING] ID {track_id} ({int(dwell_time)}s)")
+                if track_id in loitering_ids:
+                    label_suffix = " | LOITERING"
+        else:
+            if prev_state:
+                # EXIT
+                track_zone_state[track_id] = False
+                zone_entry_time.pop(track_id, None)
+                exit_count += 1
 
-        elif not inside_zone and prev_state:
-            track_zone_state[track_id] = False
-            exited_ids.add(track_id)
-            event_label = "EXIT"
-            print(f"[EXIT] ID {track_id}")
-
+        # ---------------- DRAW ----------------
         cvzone.cornerRect(img, (l, t, w, h), l=9)
-
-        label = f"ID {track_id}"
-        if event_label:
-            label += f" | {event_label}"
-
         cvzone.putTextRect(
             img,
-            label,
+            f"ID {track_id}{label_suffix}",
             (l, t - 10),
             scale=1.2,
             thickness=2,
             offset=3
         )
 
+        # Track trail
         points = track_history[track_id]
         for i in range(1, len(points)):
             cv2.line(img, points[i - 1], points[i], (255, 0, 255), 2)
 
-    cv2.putText(
-        img,
-        f"Entered: {len(entered_ids)}  Exited: {len(exited_ids)}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2
-    )
+    # ---------------- STATS ----------------
+    cv2.putText(img, f"Entered: {entry_count}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+    cv2.putText(img, f"Exited: {exit_count}", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+    cv2.putText(img, f"Loitering: {len(loitering_ids)}", (20, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
     cv2.imshow("Zone-Based People Tracking", img)
 
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
 
+# ---------------- CLEANUP ----------------
 cap.release()
 cv2.destroyAllWindows()
