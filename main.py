@@ -18,6 +18,9 @@ tracker = DeepSort(
 )
 
 track_history = defaultdict(list)
+track_zone_state = {}
+entered_ids = set()
+exited_ids = set()
 
 classNames = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -83,12 +86,34 @@ while True:
 
         track_history[track_id].append((cx, cy))
 
+        inside_zone = ZONE_Y_TOP <= cy <= ZONE_Y_BOTTOM
+        prev_state = track_zone_state.get(track_id, False)
+
+        event_label = ""
+
+        if inside_zone and not prev_state:
+            track_zone_state[track_id] = True
+            entered_ids.add(track_id)
+            event_label = "ENTER"
+            print(f"[ENTRY] ID {track_id}")
+
+        elif not inside_zone and prev_state:
+            track_zone_state[track_id] = False
+            exited_ids.add(track_id)
+            event_label = "EXIT"
+            print(f"[EXIT] ID {track_id}")
+
         cvzone.cornerRect(img, (l, t, w, h), l=9)
+
+        label = f"ID {track_id}"
+        if event_label:
+            label += f" | {event_label}"
+
         cvzone.putTextRect(
             img,
-            f"ID {track_id}",
+            label,
             (l, t - 10),
-            scale=1.3,
+            scale=1.2,
             thickness=2,
             offset=3
         )
@@ -96,6 +121,16 @@ while True:
         points = track_history[track_id]
         for i in range(1, len(points)):
             cv2.line(img, points[i - 1], points[i], (255, 0, 255), 2)
+
+    cv2.putText(
+        img,
+        f"Entered: {len(entered_ids)}  Exited: {len(exited_ids)}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0, 255, 0),
+        2
+    )
 
     cv2.imshow("Zone-Based People Tracking", img)
 
