@@ -2,14 +2,22 @@ from ultralytics import YOLO
 import cv2
 import cvzone
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from collections import defaultdict
+from collections import defaultdict, deque
 import torch
 import time
 import csv
 import numpy as np
 
+# ---------------- CONFIG ----------------
+VIDEO_PATH = "data/videos/people.mp4"
+CONF_THRESH = 0.5
+ZONE_Y_TOP = 360
+ZONE_Y_BOTTOM = 430
+LOITER_THRESHOLD = 5.0
+MAX_ALERTS = 6
+
 # ---------------- VIDEO ----------------
-cap = cv2.VideoCapture("data/videos/people.mp4")
+cap = cv2.VideoCapture(VIDEO_PATH)
 
 # ---------------- MODEL ----------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -25,25 +33,14 @@ tracker = DeepSort(
 
 # ---------------- STATE ----------------
 track_history = defaultdict(list)
+track_start_pos = {}
 track_zone_state = {}
 zone_entry_time = {}
 loitering_ids = set()
 
-# ---------------- TOGGLES ----------------
-show_tracks = False  # press 't'
-show_panel = True    # press 'p'
-
-# ---------------- ANALYTICS ----------------
-stats = {
-    "active_ids": set(),
-    "entries": 0,
-    "exits": 0,
-    "loitering": set()
-}
-
-recent_alerts = []
-MAX_ALERTS = 6
-PANEL_WIDTH = 300
+entries = 0
+exits = 0
+alerts = deque(maxlen=MAX_ALERTS)
 
 # ---------------- EVENT LOGGER ----------------
 csv_file = open("events.csv", "w", newline="")
@@ -51,164 +48,199 @@ csv_writer = csv.writer(csv_file)
 csv_writer.writerow(["timestamp", "track_id", "event", "zone"])
 
 def log_event(track_id, event):
-    timestamp = time.time()
-    csv_writer.writerow([timestamp, track_id, event, "restricted_zone"])
+    csv_writer.writerow([time.time(), track_id, event, "restricted_zone"])
     csv_file.flush()
-
-    if event == "ENTRY":
-        stats["entries"] += 1
-        recent_alerts.append(f"ID {track_id} ENTERED")
-    elif event == "EXIT":
-        stats["exits"] += 1
-        recent_alerts.append(f"ID {track_id} EXITED")
-    elif event == "LOITERING":
-        stats["loitering"].add(track_id)
-        recent_alerts.append(f"⚠ ID {track_id} LOITERING")
-
-    if len(recent_alerts) > MAX_ALERTS:
-        recent_alerts.pop(0)
-
-# ---------------- ZONE ----------------
-ZONE_Y_TOP = 360
-ZONE_Y_BOTTOM = 430
-LOITER_THRESHOLD = 5.0  # seconds
+    alerts.appendleft(f"ID {track_id} {event}")
 
 # ---------------- LOOP ----------------
 while True:
-    success, img = cap.read()
+    success, frame = cap.read()
     if not success:
         break
 
-    img = cv2.resize(img, (960, 540))
-
-    # Reset per-frame stats
-    stats["active_ids"].clear()
-
-    # Draw zone
-    cv2.rectangle(
-        img,
-        (0, ZONE_Y_TOP),
-        (img.shape[1], ZONE_Y_BOTTOM),
-        (0, 0, 255),
-        2
-    )
-
-    results = model(img, stream=True)
-    detections = []
+    frame = cv2.resize(frame, (960, 540))
+    h, w, _ = frame.shape
 
     # ---------------- DETECTION ----------------
+    detections = []
+    results = model(frame, stream=True)
+
     for r in results:
         for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            w, h = x2 - x1, y2 - y1
-            conf = float(box.conf[0])
             cls = int(box.cls[0])
-
-            if cls != 0 or conf < 0.5:
+            conf = float(box.conf[0])
+            if cls != 0 or conf < CONF_THRESH:
                 continue
 
-            detections.append(([x1, y1, w, h], conf, "person"))
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            detections.append(([x1, y1, x2 - x1, y2 - y1], conf, "person"))
 
     # ---------------- TRACKING ----------------
-    tracks = tracker.update_tracks(detections, frame=img)
+    tracks = tracker.update_tracks(detections, frame=frame)
     current_time = time.time()
+
+    active_ids = set()
+    movement_map = np.zeros((h, w, 3), dtype=np.uint8)
 
     for track in tracks:
         if not track.is_confirmed():
             continue
 
         track_id = track.track_id
-        stats["active_ids"].add(track_id)
+        active_ids.add(track_id)
 
         l, t, r, b = map(int, track.to_ltrb())
-        w, h = r - l, b - t
+        cx = (l + r) // 2
+        cy = b
 
-        cx = l + w // 2
-        cy = b  # bottom-center
+        if track_id not in track_start_pos:
+            track_start_pos[track_id] = (cx, cy)
 
         track_history[track_id].append((cx, cy))
+        history = track_history[track_id]
 
+        # ---------------- ZONE LOGIC ----------------
         inside_zone = ZONE_Y_TOP <= cy <= ZONE_Y_BOTTOM
         prev_state = track_zone_state.get(track_id, False)
 
-        label = f"ID {track_id}"
+        if inside_zone and not prev_state:
+            track_zone_state[track_id] = True
+            zone_entry_time[track_id] = current_time
+            entries += 1
+            log_event(track_id, "ENTERED")
 
-        # -------- ENTRY / EXIT / LOITER --------
-        if inside_zone:
-            if not prev_state:
-                track_zone_state[track_id] = True
-                zone_entry_time[track_id] = current_time
-                log_event(track_id, "ENTRY")
-            else:
-                dwell_time = current_time - zone_entry_time.get(track_id, current_time)
-                if dwell_time >= LOITER_THRESHOLD and track_id not in loitering_ids:
-                    loitering_ids.add(track_id)
-                    log_event(track_id, "LOITERING")
-                if track_id in loitering_ids:
-                    label += " | LOITERING"
-        else:
-            if prev_state:
-                track_zone_state[track_id] = False
-                zone_entry_time.pop(track_id, None)
-                log_event(track_id, "EXIT")
+        elif inside_zone and prev_state:
+            dwell = current_time - zone_entry_time.get(track_id, current_time)
+            if dwell >= LOITER_THRESHOLD and track_id not in loitering_ids:
+                loitering_ids.add(track_id)
+                log_event(track_id, "LOITERING")
 
-        # ---------------- DRAW ----------------
-        cvzone.cornerRect(img, (l, t, w, h), l=8)
-        cvzone.putTextRect(img, label, (l, t - 10), scale=1, thickness=2)
+        elif not inside_zone and prev_state:
+            track_zone_state[track_id] = False
+            zone_entry_time.pop(track_id, None)
+            exits += 1
+            log_event(track_id, "EXITED")
 
-        if show_tracks:
-            pts = track_history[track_id]
-            for i in range(1, len(pts)):
-                cv2.line(img, pts[i - 1], pts[i], (200, 0, 200), 2)
+        # ---------------- DRAW VIDEO ----------------
+        label = str(track_id)
+        if track_id in loitering_ids:
+            label += " | LOITER"
 
-    # ---------------- SIDE PANEL ----------------
-    if show_panel:
-        panel = np.zeros((img.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-        panel[:] = (30, 30, 30)
+        cvzone.cornerRect(frame, (l, t, r - l, b - t), l=8)
+        cvzone.putTextRect(frame, label, (l, t - 10), scale=1, thickness=2)
 
-        cv2.putText(panel, "ANALYTICS", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        # ---------------- MOVEMENT MAP ----------------
+        for i in range(1, len(history)):
+            x1, y1 = history[i - 1]
+            x2, y2 = history[i]
+            cv2.line(movement_map, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        y = 80
-        gap = 35
+        cv2.circle(movement_map, (cx, cy), 6, (0, 255, 255), -1)
 
-        cv2.putText(panel, f"Active IDs: {len(stats['active_ids'])}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        y += gap
+        if len(history) >= 2:
+            px, py = history[-2]
+            cv2.arrowedLine(
+                movement_map,
+                (px, py),
+                (cx, cy),
+                (255, 255, 0),
+                2,
+                tipLength=0.4
+            )
 
-        cv2.putText(panel, f"Entries: {stats['entries']}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        y += gap
+        # Start-point ID box
+        sx, sy = track_start_pos[track_id]
+        cv2.rectangle(
+            movement_map,
+            (sx - 12, sy - 20),
+            (sx + 12, sy - 4),
+            (60, 60, 60),
+            -1
+        )
+        cv2.putText(
+            movement_map,
+            str(track_id),
+            (sx - 6, sy - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
 
-        cv2.putText(panel, f"Exits: {stats['exits']}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        y += gap
+    # ---------------- DRAW ZONE ----------------
+    cv2.rectangle(frame, (0, ZONE_Y_TOP), (w, ZONE_Y_BOTTOM), (0, 0, 255), 2)
 
-        cv2.putText(panel, f"Loitering: {len(stats['loitering'])}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+    # ---------------- DASHBOARD ----------------
+    DASH_H, DASH_W = 700, 1500
+    dashboard = np.zeros((DASH_H, DASH_W, 3), dtype=np.uint8)
+    dashboard[:] = (20, 20, 20)
 
-        cv2.putText(panel, "ALERTS", (20, y + 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+    # Place movement map on LEFT
+    MAP_X, MAP_Y = 40, 80
+    dashboard[MAP_Y:MAP_Y+h, MAP_X:MAP_X+w] = movement_map
 
-        ay = y + 90
-        for alert in recent_alerts:
-            cv2.putText(panel, alert, (20, ay),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-            ay += 25
+    # RIGHT PANEL
+    RIGHT_X = MAP_X + w + 60
+    RIGHT_Y = MAP_Y
+    GAP = 32
 
-        final_frame = cv2.hconcat([img, panel])
-    else:
-        final_frame = img
+    cv2.putText(
+        dashboard,
+        "BEHAVIOR ANALYSIS",
+        (RIGHT_X, RIGHT_Y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2
+    )
 
-    cv2.imshow("Behavior Analysis System", final_frame)
+    stats = [
+        f"Active IDs: {len(active_ids)}",
+        f"Entries: {entries}",
+        f"Exits: {exits}",
+        f"Loitering: {len(loitering_ids)}"
+    ]
 
-    key = cv2.waitKey(5) & 0xFF
-    if key == ord('q'):
+    for i, s in enumerate(stats):
+        cv2.putText(
+            dashboard,
+            s,
+            (RIGHT_X, RIGHT_Y + 40 + i * GAP),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
+
+    alert_y = RIGHT_Y + 40 + len(stats) * GAP + 40
+
+    cv2.putText(
+        dashboard,
+        "ALERTS",
+        (RIGHT_X, alert_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2
+    )
+
+    for i, alert in enumerate(alerts):
+        cv2.putText(
+            dashboard,
+            alert,
+            (RIGHT_X, alert_y + 40 + i * GAP),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2
+        )
+
+    # ---------------- SHOW WINDOWS ----------------
+    cv2.imshow("Video Feed", frame)
+    cv2.imshow("Analytics Dashboard", dashboard)
+
+    if cv2.waitKey(5) & 0xFF == ord('q'):
         break
-    if key == ord('t'):
-        show_tracks = not show_tracks
-    if key == ord('p'):
-        show_panel = not show_panel
 
 # ---------------- CLEANUP ----------------
 csv_file.close()
