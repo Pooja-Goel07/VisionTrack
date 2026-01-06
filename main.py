@@ -6,6 +6,7 @@ from collections import defaultdict
 import torch
 import time
 import csv
+import numpy as np
 
 # ---------------- VIDEO ----------------
 cap = cv2.VideoCapture("data/videos/people.mp4")
@@ -29,10 +30,22 @@ zone_entry_time = {}
 loitering_ids = set()
 
 # ---------------- TOGGLES ----------------
-show_tracks = False  # press 't' to toggle
+show_tracks = False  # press 't'
+show_panel = True    # press 'p'
+
+# ---------------- ANALYTICS ----------------
+stats = {
+    "active_ids": set(),
+    "entries": 0,
+    "exits": 0,
+    "loitering": set()
+}
+
+recent_alerts = []
+MAX_ALERTS = 6
+PANEL_WIDTH = 300
 
 # ---------------- EVENT LOGGER ----------------
-event_log = []
 csv_file = open("events.csv", "w", newline="")
 csv_writer = csv.writer(csv_file)
 csv_writer.writerow(["timestamp", "track_id", "event", "zone"])
@@ -41,6 +54,19 @@ def log_event(track_id, event):
     timestamp = time.time()
     csv_writer.writerow([timestamp, track_id, event, "restricted_zone"])
     csv_file.flush()
+
+    if event == "ENTRY":
+        stats["entries"] += 1
+        recent_alerts.append(f"ID {track_id} ENTERED")
+    elif event == "EXIT":
+        stats["exits"] += 1
+        recent_alerts.append(f"ID {track_id} EXITED")
+    elif event == "LOITERING":
+        stats["loitering"].add(track_id)
+        recent_alerts.append(f"⚠ ID {track_id} LOITERING")
+
+    if len(recent_alerts) > MAX_ALERTS:
+        recent_alerts.pop(0)
 
 # ---------------- ZONE ----------------
 ZONE_Y_TOP = 360
@@ -54,6 +80,9 @@ while True:
         break
 
     img = cv2.resize(img, (960, 540))
+
+    # Reset per-frame stats
+    stats["active_ids"].clear()
 
     # Draw zone
     cv2.rectangle(
@@ -75,7 +104,7 @@ while True:
             conf = float(box.conf[0])
             cls = int(box.cls[0])
 
-            if cls != 0 or conf < 0.5:  # class 0 = person
+            if cls != 0 or conf < 0.5:
                 continue
 
             detections.append(([x1, y1, w, h], conf, "person"))
@@ -89,11 +118,13 @@ while True:
             continue
 
         track_id = track.track_id
+        stats["active_ids"].add(track_id)
+
         l, t, r, b = map(int, track.to_ltrb())
         w, h = r - l, b - t
 
         cx = l + w // 2
-        cy = b  # bottom center
+        cy = b  # bottom-center
 
         track_history[track_id].append((cx, cy))
 
@@ -102,7 +133,7 @@ while True:
 
         label = f"ID {track_id}"
 
-        # ---------------- ENTRY / EXIT / LOITER ----------------
+        # -------- ENTRY / EXIT / LOITER --------
         if inside_zone:
             if not prev_state:
                 track_zone_state[track_id] = True
@@ -121,30 +152,63 @@ while True:
                 zone_entry_time.pop(track_id, None)
                 log_event(track_id, "EXIT")
 
-        # ---------------- DRAW (CLEAN) ----------------
+        # ---------------- DRAW ----------------
         cvzone.cornerRect(img, (l, t, w, h), l=8)
-        cvzone.putTextRect(
-            img,
-            label,
-            (l, t - 10),
-            scale=1,
-            thickness=2,
-            offset=3
-        )
+        cvzone.putTextRect(img, label, (l, t - 10), scale=1, thickness=2)
 
-        # Optional trajectory
         if show_tracks:
             pts = track_history[track_id]
             for i in range(1, len(pts)):
                 cv2.line(img, pts[i - 1], pts[i], (200, 0, 200), 2)
 
-    cv2.imshow("Behavior Analysis (Clean View)", img)
+    # ---------------- SIDE PANEL ----------------
+    if show_panel:
+        panel = np.zeros((img.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
+        panel[:] = (30, 30, 30)
+
+        cv2.putText(panel, "ANALYTICS", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        y = 80
+        gap = 35
+
+        cv2.putText(panel, f"Active IDs: {len(stats['active_ids'])}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        y += gap
+
+        cv2.putText(panel, f"Entries: {stats['entries']}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        y += gap
+
+        cv2.putText(panel, f"Exits: {stats['exits']}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        y += gap
+
+        cv2.putText(panel, f"Loitering: {len(stats['loitering'])}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+
+        cv2.putText(panel, "ALERTS", (20, y + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+        ay = y + 90
+        for alert in recent_alerts:
+            cv2.putText(panel, alert, (20, ay),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+            ay += 25
+
+        final_frame = cv2.hconcat([img, panel])
+    else:
+        final_frame = img
+
+    cv2.imshow("Behavior Analysis System", final_frame)
 
     key = cv2.waitKey(5) & 0xFF
     if key == ord('q'):
         break
     if key == ord('t'):
         show_tracks = not show_tracks
+    if key == ord('p'):
+        show_panel = not show_panel
 
 # ---------------- CLEANUP ----------------
 csv_file.close()
